@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,22 +34,10 @@ var commands = []*discordgo.ApplicationCommand{
 		Description: "Google Meet のリンクを発行し、依頼者と招待ユーザーの DM に送信します",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
-				Type:        discordgo.ApplicationCommandOptionUser,
+				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        "招待",
-				Description: "招待する Discord ユーザー",
+				Description: "招待する Discord ユーザーを @メンションで指定（複数可、スペース区切り）",
 				Required:    true,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionUser,
-				Name:        "招待2",
-				Description: "追加で招待する Discord ユーザー（任意）",
-				Required:    false,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionUser,
-				Name:        "招待3",
-				Description: "追加で招待する Discord ユーザー（任意）",
-				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
@@ -58,8 +47,8 @@ var commands = []*discordgo.ApplicationCommand{
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionInteger,
-				Name:        "分",
-				Description: "会議の長さ（分単位、既定 30）",
+				Name:        "会議時間",
+				Description: "会議時間 (分)（任意、既定 30）",
 				Required:    false,
 				MinValue:    ptrFloat(1),
 				MaxValue:    600,
@@ -89,6 +78,8 @@ func (b *Bot) Stop() error {
 	return b.session.Close()
 }
 
+var userMentionRe = regexp.MustCompile(`<@!?(\d+)>`)
+
 func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
@@ -106,22 +97,22 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 
 	title := ""
 	duration := 30 * time.Minute
-	var invitees []*discordgo.User
-	seen := map[string]bool{inviter.ID: true}
+	inviteeRaw := ""
 	for _, opt := range data.Options {
 		switch opt.Name {
 		case "タイトル":
 			title = opt.StringValue()
-		case "分":
+		case "会議時間":
 			duration = time.Duration(opt.IntValue()) * time.Minute
-		case "招待", "招待2", "招待3":
-			u := opt.UserValue(s)
-			if u == nil || u.Bot || seen[u.ID] {
-				continue
-			}
-			seen[u.ID] = true
-			invitees = append(invitees, u)
+		case "招待":
+			inviteeRaw = opt.StringValue()
 		}
+	}
+
+	invitees := resolveInvitees(s, &data, inviteeRaw, inviter.ID)
+	if len(invitees) == 0 {
+		respondEphemeral(s, i, "招待ユーザーを @メンションで1名以上指定してください。")
+		return
 	}
 
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -177,13 +168,11 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		fmt.Sprintf("**%s** を作成しました。", displayTitle),
 		fmt.Sprintf("依頼者: %s", inviter.Mention()),
 	}
-	if len(invitees) > 0 {
-		ms := make([]string, 0, len(invitees))
-		for _, u := range invitees {
-			ms = append(ms, u.Mention())
-		}
-		lines = append(lines, fmt.Sprintf("招待: %s", strings.Join(ms, " ")))
+	ms := make([]string, 0, len(invitees))
+	for _, u := range invitees {
+		ms = append(ms, u.Mention())
 	}
+	lines = append(lines, fmt.Sprintf("招待: %s", strings.Join(ms, " ")))
 	lines = append(lines, "DM に Meet リンクを送信しました。")
 	if len(failed) > 0 {
 		lines = append(lines, fmt.Sprintf("次のユーザーには DM を送信できませんでした（DM 受信設定をご確認ください）: %s", strings.Join(failed, " ")))
@@ -196,6 +185,52 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		},
 	}); err != nil {
 		log.Printf("edit response: %v", err)
+	}
+}
+
+func resolveInvitees(s *discordgo.Session, data *discordgo.ApplicationCommandInteractionData, raw, inviterID string) []*discordgo.User {
+	matches := userMentionRe.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]bool{inviterID: true}
+	out := make([]*discordgo.User, 0, len(matches))
+	for _, m := range matches {
+		id := m[1]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		var u *discordgo.User
+		if data.Resolved != nil && data.Resolved.Users != nil {
+			u = data.Resolved.Users[id]
+		}
+		if u == nil {
+			fetched, err := s.User(id)
+			if err != nil {
+				log.Printf("fetch user %s: %v", id, err)
+				continue
+			}
+			u = fetched
+		}
+		if u.Bot {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, msg string) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: msg,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	}); err != nil {
+		log.Printf("respond ephemeral: %v", err)
 	}
 }
 
