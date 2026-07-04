@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	_ "time/tzdata" // embed the timezone database (distroless image has no tzdata)
 
 	"github.com/dokkiitech/discordmeetmakebot/internal/bot"
 	"github.com/dokkiitech/discordmeetmakebot/internal/meet"

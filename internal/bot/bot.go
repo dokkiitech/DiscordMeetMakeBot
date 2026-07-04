@@ -2,8 +2,11 @@ package bot
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -11,12 +14,24 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/dokkiitech/discordmeetmakebot/internal/meet"
+	"github.com/dokkiitech/discordmeetmakebot/internal/scheduler"
 )
+
+// jst is the timezone used to interpret and display scheduled meeting times.
+var jst = loadJST()
+
+func loadJST() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Tokyo"); err == nil {
+		return loc
+	}
+	return time.FixedZone("JST", 9*60*60)
+}
 
 type Bot struct {
 	session *discordgo.Session
 	meet    *meet.Client
 	guildID string
+	sched   *scheduler.Scheduler
 }
 
 func New(token string, guildID string, meetClient *meet.Client) (*Bot, error) {
@@ -25,7 +40,9 @@ func New(token string, guildID string, meetClient *meet.Client) (*Bot, error) {
 		return nil, fmt.Errorf("new discord session: %w", err)
 	}
 	s.Identify.Intents = discordgo.IntentsGuilds
-	return &Bot{session: s, meet: meetClient, guildID: guildID}, nil
+	b := &Bot{session: s, meet: meetClient, guildID: guildID}
+	b.sched = scheduler.New(os.Getenv("SCHEDULE_STORE_PATH"), b.sendReminder)
+	return b, nil
 }
 
 var commands = []*discordgo.ApplicationCommand{
@@ -53,6 +70,12 @@ var commands = []*discordgo.ApplicationCommand{
 				MinValue:    ptrFloat(1),
 				MaxValue:    600,
 			},
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "日時",
+				Description: "予約する開始日時（任意、JST）。例: 2026-07-10 15:00 / 07-10 15:00 / 15:00",
+				Required:    false,
+			},
 		},
 	},
 }
@@ -71,11 +94,25 @@ func (b *Bot) Start(ctx context.Context) error {
 		return fmt.Errorf("register slash commands: %w", err)
 	}
 	log.Printf("registered %d slash command(s)", len(registered))
+
+	if err := b.sched.Start(); err != nil {
+		return fmt.Errorf("start scheduler: %w", err)
+	}
 	return nil
 }
 
 func (b *Bot) Stop() error {
+	b.sched.Stop()
 	return b.session.Close()
+}
+
+// sendReminder delivers a scheduled reminder to each recipient's DM.
+func (b *Bot) sendReminder(recipients []string, content string) {
+	for _, id := range recipients {
+		if err := sendDM(b.session, id, content); err != nil {
+			log.Printf("send reminder DM to %s: %v", id, err)
+		}
+	}
 }
 
 var userMentionRe = regexp.MustCompile(`<@!?(\d+)>`)
@@ -98,6 +135,7 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	title := ""
 	duration := 30 * time.Minute
 	inviteeRaw := ""
+	scheduleRaw := ""
 	for _, opt := range data.Options {
 		switch opt.Name {
 		case "タイトル":
@@ -106,6 +144,8 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 			duration = time.Duration(opt.IntValue()) * time.Minute
 		case "招待":
 			inviteeRaw = opt.StringValue()
+		case "日時":
+			scheduleRaw = opt.StringValue()
 		}
 	}
 
@@ -113,6 +153,23 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	if len(invitees) == 0 {
 		respondEphemeral(s, i, "招待ユーザーを @メンションで1名以上指定してください。")
 		return
+	}
+
+	now := time.Now()
+	var start time.Time
+	scheduled := false
+	if strings.TrimSpace(scheduleRaw) != "" {
+		t, err := parseSchedule(scheduleRaw, now.In(jst))
+		if err != nil {
+			respondEphemeral(s, i, "日時の形式を認識できませんでした。例: 2026-07-10 15:00 / 07-10 15:00 / 15:00（JST）")
+			return
+		}
+		if !t.After(now) {
+			respondEphemeral(s, i, "未来の日時を指定してください。")
+			return
+		}
+		start = t
+		scheduled = true
 	}
 
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -125,7 +182,11 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	url, err := b.meet.CreateMeeting(ctx, title, duration)
+	meetingStart := now
+	if scheduled {
+		meetingStart = start
+	}
+	url, err := b.meet.CreateMeetingAt(ctx, title, meetingStart, duration)
 	if err != nil {
 		log.Printf("create meeting: %v", err)
 		msg := "Meet リンクの作成に失敗しました。時間をおいて再度お試しください。"
@@ -147,45 +208,101 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	for _, u := range invitees {
 		participantMentions = append(participantMentions, u.Mention())
 	}
-	dmContent := fmt.Sprintf(
-		"**%s**\n依頼者: %s\n参加者: %s\n%s",
-		displayTitle,
-		inviter.Mention(),
-		strings.Join(participantMentions, " "),
-		url,
-	)
-
+	participants := strings.Join(participantMentions, " ")
 	recipients := append([]*discordgo.User{inviter}, invitees...)
-	var failed []string
-	for _, u := range recipients {
-		if err := sendDM(s, u.ID, dmContent); err != nil {
-			log.Printf("send DM to %s: %v", u.ID, err)
-			failed = append(failed, u.Mention())
-		}
+
+	delay := time.Duration(0)
+	if scheduled {
+		delay = start.Sub(now)
 	}
+
+	// Immediate delivery: no schedule given, or start is within 30 minutes.
+	// The Meet URL is delivered right away.
+	if !scheduled || delay <= 30*time.Minute {
+		var dmContent string
+		if scheduled {
+			dmContent = fmt.Sprintf(
+				"**%s**\n開始日時: %s\n依頼者: %s\n参加者: %s\n%s",
+				displayTitle, formatJST(start), inviter.Mention(), participants, url,
+			)
+		} else {
+			dmContent = fmt.Sprintf(
+				"**%s**\n依頼者: %s\n参加者: %s\n%s",
+				displayTitle, inviter.Mention(), participants, url,
+			)
+		}
+		failed := b.deliverDM(s, recipients, dmContent)
+
+		lines := []string{fmt.Sprintf("**%s** を作成しました。", displayTitle)}
+		if scheduled {
+			lines = append(lines, fmt.Sprintf("開始日時: %s", formatJST(start)))
+		}
+		lines = append(lines,
+			fmt.Sprintf("依頼者: %s", inviter.Mention()),
+			fmt.Sprintf("招待: %s", mentionsOf(invitees)),
+			"DM に Meet リンクを送信しました。",
+		)
+		if len(failed) > 0 {
+			lines = append(lines, fmt.Sprintf("次のユーザーには DM を送信できませんでした（DM 受信設定をご確認ください）: %s", strings.Join(failed, " ")))
+		}
+		b.editResponse(s, i, strings.Join(lines, "\n"))
+		return
+	}
+
+	// Scheduled in the future: notify participants now (without the URL) and
+	// deliver the Meet URL via a reminder 30 minutes before the start.
+	twoDaysAhead := delay >= 48*time.Hour
+
+	reminderNote := "開始30分前に Meet リンクをお送りします。"
+	if twoDaysAhead {
+		reminderNote = "開始1日前と30分前にリマインドします（Meet リンクは30分前にお送りします）。"
+	}
+	createContent := fmt.Sprintf(
+		"**%s** の予約を作成しました。\n開始日時: %s\n依頼者: %s\n参加者: %s\n%s",
+		displayTitle, formatJST(start), inviter.Mention(), participants, reminderNote,
+	)
+	failed := b.deliverDM(s, recipients, createContent)
+
+	recipientIDs := make([]string, 0, len(recipients))
+	for _, u := range recipients {
+		recipientIDs = append(recipientIDs, u.ID)
+	}
+
+	base := randomID()
+	var rems []scheduler.Reminder
+	if twoDaysAhead {
+		rems = append(rems, scheduler.Reminder{
+			ID:         base + "-1d",
+			FireAt:     start.Add(-24 * time.Hour),
+			Recipients: recipientIDs,
+			Content: fmt.Sprintf(
+				"【リマインド】明日 %s に **%s** が予定されています。\n依頼者: %s\n参加者: %s\n開始30分前に Meet リンクをお送りします。",
+				formatJST(start), displayTitle, inviter.Mention(), participants,
+			),
+		})
+	}
+	rems = append(rems, scheduler.Reminder{
+		ID:         base + "-30m",
+		FireAt:     start.Add(-30 * time.Minute),
+		Recipients: recipientIDs,
+		Content: fmt.Sprintf(
+			"【リマインド】まもなく %s に **%s** が始まります（開始30分前）。\n依頼者: %s\n参加者: %s\n%s",
+			formatJST(start), displayTitle, inviter.Mention(), participants, url,
+		),
+	})
+	b.sched.Schedule(rems...)
 
 	lines := []string{
-		fmt.Sprintf("**%s** を作成しました。", displayTitle),
+		fmt.Sprintf("**%s** を予約しました。", displayTitle),
+		fmt.Sprintf("開始日時: %s", formatJST(start)),
 		fmt.Sprintf("依頼者: %s", inviter.Mention()),
+		fmt.Sprintf("招待: %s", mentionsOf(invitees)),
+		"DM に予約の通知を送信しました。" + reminderNote,
 	}
-	ms := make([]string, 0, len(invitees))
-	for _, u := range invitees {
-		ms = append(ms, u.Mention())
-	}
-	lines = append(lines, fmt.Sprintf("招待: %s", strings.Join(ms, " ")))
-	lines = append(lines, "DM に Meet リンクを送信しました。")
 	if len(failed) > 0 {
 		lines = append(lines, fmt.Sprintf("次のユーザーには DM を送信できませんでした（DM 受信設定をご確認ください）: %s", strings.Join(failed, " ")))
 	}
-	channelMsg := strings.Join(lines, "\n")
-	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content: &channelMsg,
-		AllowedMentions: &discordgo.MessageAllowedMentions{
-			Parse: []discordgo.AllowedMentionType{},
-		},
-	}); err != nil {
-		log.Printf("edit response: %v", err)
-	}
+	b.editResponse(s, i, strings.Join(lines, "\n"))
 }
 
 func resolveInvitees(s *discordgo.Session, data *discordgo.ApplicationCommandInteractionData, raw, inviterID string) []*discordgo.User {
@@ -250,4 +367,98 @@ func sendDM(s *discordgo.Session, userID, content string) error {
 		return fmt.Errorf("send dm message: %w", err)
 	}
 	return nil
+}
+
+// deliverDM sends content to each recipient's DM and returns the mentions of
+// users who could not be reached.
+func (b *Bot) deliverDM(s *discordgo.Session, recipients []*discordgo.User, content string) []string {
+	var failed []string
+	for _, u := range recipients {
+		if err := sendDM(s, u.ID, content); err != nil {
+			log.Printf("send DM to %s: %v", u.ID, err)
+			failed = append(failed, u.Mention())
+		}
+	}
+	return failed
+}
+
+// editResponse replaces the deferred interaction response with msg, suppressing
+// mention pings.
+func (b *Bot) editResponse(s *discordgo.Session, i *discordgo.InteractionCreate, msg string) {
+	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &msg,
+		AllowedMentions: &discordgo.MessageAllowedMentions{
+			Parse: []discordgo.AllowedMentionType{},
+		},
+	}); err != nil {
+		log.Printf("edit response: %v", err)
+	}
+}
+
+func mentionsOf(users []*discordgo.User) string {
+	ms := make([]string, 0, len(users))
+	for _, u := range users {
+		ms = append(ms, u.Mention())
+	}
+	return strings.Join(ms, " ")
+}
+
+func formatJST(t time.Time) string {
+	return t.In(jst).Format("2006-01-02 15:04") + " (JST)"
+}
+
+func randomID() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
+// parseSchedule interprets a user-supplied date/time string in JST relative to
+// now. It accepts full dates, month-day, and time-only forms; month-day and
+// time-only values roll forward to the next future occurrence.
+func parseSchedule(raw string, now time.Time) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("empty datetime")
+	}
+
+	type layout struct {
+		fmt      string
+		withYear bool
+		timeOnly bool
+	}
+	layouts := []layout{
+		{"2006-01-02 15:04", true, false},
+		{"2006/01/02 15:04", true, false},
+		{"2006-1-2 15:04", true, false},
+		{"2006/1/2 15:04", true, false},
+		{"01-02 15:04", false, false},
+		{"1-2 15:04", false, false},
+		{"01/02 15:04", false, false},
+		{"1/2 15:04", false, false},
+		{"15:04", false, true},
+	}
+
+	for _, l := range layouts {
+		t, err := time.ParseInLocation(l.fmt, raw, jst)
+		if err != nil {
+			continue
+		}
+		switch {
+		case l.timeOnly:
+			t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, jst)
+			if !t.After(now) {
+				t = t.AddDate(0, 0, 1)
+			}
+		case !l.withYear:
+			t = time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, jst)
+			if t.Before(now) {
+				t = t.AddDate(1, 0, 0)
+			}
+		}
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("unrecognized datetime format: %q", raw)
 }

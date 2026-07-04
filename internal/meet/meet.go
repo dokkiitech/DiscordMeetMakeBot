@@ -60,14 +60,23 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 // CreateMeeting creates a calendar event with a Meet conference and returns the
 // Meet join URL. The event is short (30 minutes by default starting now).
 func (c *Client) CreateMeeting(ctx context.Context, title string, duration time.Duration) (string, error) {
+	return c.CreateMeetingAt(ctx, title, time.Now(), duration)
+}
+
+// CreateMeetingAt creates a calendar event with a Meet conference starting at the
+// given time and returns the Meet join URL. The event can be scheduled in the
+// future; the Meet link is issued immediately regardless of the start time.
+func (c *Client) CreateMeetingAt(ctx context.Context, title string, start time.Time, duration time.Duration) (string, error) {
 	if title == "" {
 		title = "Discord Meet"
 	}
 	if duration <= 0 {
 		duration = 30 * time.Minute
 	}
-	now := time.Now()
-	end := now.Add(duration)
+	if start.IsZero() {
+		start = time.Now()
+	}
+	end := start.Add(duration)
 
 	reqID, err := randomRequestID()
 	if err != nil {
@@ -78,7 +87,7 @@ func (c *Client) CreateMeeting(ctx context.Context, title string, duration time.
 		Summary:     title,
 		Description: "Created by DiscordMeetMakeBot",
 		Start: &calendar.EventDateTime{
-			DateTime: now.Format(time.RFC3339),
+			DateTime: start.Format(time.RFC3339),
 		},
 		End: &calendar.EventDateTime{
 			DateTime: end.Format(time.RFC3339),
