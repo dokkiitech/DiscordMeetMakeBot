@@ -55,7 +55,7 @@ var commands = []*discordgo.ApplicationCommand{
 				Type:        discordgo.ApplicationCommandOptionUser,
 				Name:        "招待",
 				Description: "招待する Discord ユーザー（モーダルでも追加・編集可能）",
-				Required:    true,
+				Required:    false,
 			},
 		},
 	},
