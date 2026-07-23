@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,38 +50,8 @@ var commands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "meet",
 		Description: "Google Meet のリンクを発行し、依頼者と招待ユーザーの DM に送信します",
-		Options: []*discordgo.ApplicationCommandOption{
-			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        "招待",
-				Description: "招待する Discord ユーザーを @メンションで指定（複数可、スペース区切り）",
-				Required:    true,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        "タイトル",
-				Description: "会議のタイトル（任意）",
-				Required:    false,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionInteger,
-				Name:        "会議時間",
-				Description: "会議時間 (分)（任意、既定 30）",
-				Required:    false,
-				MinValue:    ptrFloat(1),
-				MaxValue:    600,
-			},
-			{
-				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        "日時",
-				Description: "予約する開始日時（任意、JST）。例: 2026-07-10 15:00 / 07-10 15:00 / 15:00",
-				Required:    false,
-			},
-		},
 	},
 }
-
-func ptrFloat(v float64) *float64 { return &v }
 
 func (b *Bot) Start(ctx context.Context) error {
 	b.session.AddHandler(b.handleInteraction)
@@ -118,6 +89,15 @@ func (b *Bot) sendReminder(recipients []string, content string) {
 var userMentionRe = regexp.MustCompile(`<@!?(\d+)>`)
 
 func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	switch i.Type {
+	case discordgo.InteractionApplicationCommand:
+		b.handleMeetCommand(s, i)
+	case discordgo.InteractionModalSubmit:
+		b.handleMeetModalSubmit(s, i)
+	}
+}
+
+func (b *Bot) handleMeetCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
 	}
@@ -126,30 +106,89 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseModal,
+		Data: &discordgo.InteractionResponseData{
+			CustomID: "meet_modal",
+			Title:    "Meet リンクを作成",
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "meet_invitees",
+							Label:       "招待するユーザー",
+							Style:       discordgo.TextInputShort,
+							Required:    true,
+							Placeholder: "@user1 @user2 のようにメンションで入力（スペース区切り）",
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID: "meet_title",
+							Label:    "会議タイトル",
+							Style:    discordgo.TextInputShort,
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "meet_duration",
+							Label:       "会議時間（分）",
+							Style:       discordgo.TextInputShort,
+							Placeholder: "30",
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "meet_schedule",
+							Label:       "開始日時（JST、任意）",
+							Style:       discordgo.TextInputShort,
+							Placeholder: "例: 2026-07-10 15:00 / 07-10 15:00 / 15:00",
+						},
+					},
+				},
+			},
+		},
+	}); err != nil {
+		log.Printf("respond modal: %v", err)
+	}
+}
+
+func (b *Bot) handleMeetModalSubmit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	data := i.ModalSubmitData()
+	if data.CustomID != "meet_modal" {
+		return
+	}
+
+	values := modalValues(data.Components)
+
 	inviter := interactionUser(i)
 	if inviter == nil {
 		log.Printf("could not resolve inviter user")
 		return
 	}
 
-	title := ""
+	inviteeRaw := values["meet_invitees"]
+	title := values["meet_title"]
+	durationRaw := values["meet_duration"]
+	scheduleRaw := values["meet_schedule"]
+
 	duration := 30 * time.Minute
-	inviteeRaw := ""
-	scheduleRaw := ""
-	for _, opt := range data.Options {
-		switch opt.Name {
-		case "タイトル":
-			title = opt.StringValue()
-		case "会議時間":
-			duration = time.Duration(opt.IntValue()) * time.Minute
-		case "招待":
-			inviteeRaw = opt.StringValue()
-		case "日時":
-			scheduleRaw = opt.StringValue()
+	if strings.TrimSpace(durationRaw) != "" {
+		min, err := strconv.Atoi(strings.TrimSpace(durationRaw))
+		if err != nil || min < 1 || min > 600 {
+			respondEphemeral(s, i, "会議時間は 1〜600 分の数値で入力してください。")
+			return
 		}
+		duration = time.Duration(min) * time.Minute
 	}
 
-	invitees := resolveInvitees(s, &data, inviteeRaw, inviter.ID)
+	invitees := resolveInvitees(s, nil, inviteeRaw, inviter.ID)
 	if len(invitees) == 0 {
 		respondEphemeral(s, i, "招待ユーザーを @メンションで1名以上指定してください。")
 		return
@@ -179,10 +218,37 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
+	b.createAndDeliverMeeting(s, i, inviter, invitees, title, duration, scheduled, start)
+}
+
+func modalValues(components []discordgo.MessageComponent) map[string]string {
+	values := make(map[string]string)
+	for _, row := range components {
+		actionsRow, ok := row.(*discordgo.ActionsRow)
+		if !ok {
+			if ar, ok := row.(discordgo.ActionsRow); ok {
+				actionsRow = &ar
+			} else {
+				continue
+			}
+		}
+		for _, comp := range actionsRow.Components {
+			switch input := comp.(type) {
+			case *discordgo.TextInput:
+				values[input.CustomID] = input.Value
+			case discordgo.TextInput:
+				values[input.CustomID] = input.Value
+			}
+		}
+	}
+	return values
+}
+
+func (b *Bot) createAndDeliverMeeting(s *discordgo.Session, i *discordgo.InteractionCreate, inviter *discordgo.User, invitees []*discordgo.User, title string, duration time.Duration, scheduled bool, start time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	meetingStart := now
+	meetingStart := time.Now()
 	if scheduled {
 		meetingStart = start
 	}
@@ -211,6 +277,7 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	participants := strings.Join(participantMentions, " ")
 	recipients := append([]*discordgo.User{inviter}, invitees...)
 
+	now := time.Now()
 	delay := time.Duration(0)
 	if scheduled {
 		delay = start.Sub(now)
@@ -305,7 +372,7 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	b.editResponse(s, i, strings.Join(lines, "\n"))
 }
 
-func resolveInvitees(s *discordgo.Session, data *discordgo.ApplicationCommandInteractionData, raw, inviterID string) []*discordgo.User {
+func resolveInvitees(s *discordgo.Session, resolved map[string]*discordgo.User, raw, inviterID string) []*discordgo.User {
 	matches := userMentionRe.FindAllStringSubmatch(raw, -1)
 	if len(matches) == 0 {
 		return nil
@@ -320,8 +387,8 @@ func resolveInvitees(s *discordgo.Session, data *discordgo.ApplicationCommandInt
 		seen[id] = true
 
 		var u *discordgo.User
-		if data.Resolved != nil && data.Resolved.Users != nil {
-			u = data.Resolved.Users[id]
+		if resolved != nil {
+			u = resolved[id]
 		}
 		if u == nil {
 			fetched, err := s.User(id)
