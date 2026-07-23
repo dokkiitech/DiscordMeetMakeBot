@@ -50,6 +50,14 @@ var commands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "meet",
 		Description: "Google Meet のリンクを発行し、依頼者と招待ユーザーの DM に送信します",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionUser,
+				Name:        "招待",
+				Description: "招待する Discord ユーザー（モーダルでも追加・編集可能）",
+				Required:    true,
+			},
+		},
 	},
 }
 
@@ -106,6 +114,15 @@ func (b *Bot) handleMeetCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
+	defaultInvitees := ""
+	for _, opt := range data.Options {
+		if opt.Name == "招待" {
+			if u := opt.UserValue(s); u != nil {
+				defaultInvitees = u.Mention()
+			}
+		}
+	}
+
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
@@ -119,6 +136,7 @@ func (b *Bot) handleMeetCommand(s *discordgo.Session, i *discordgo.InteractionCr
 							Label:       "招待するユーザー",
 							Style:       discordgo.TextInputShort,
 							Required:    true,
+							Value:       defaultInvitees,
 							Placeholder: "@user1 @user2 のようにメンションで入力（スペース区切り）",
 						},
 					},
